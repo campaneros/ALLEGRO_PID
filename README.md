@@ -11,7 +11,7 @@ Each run writes `model.pt`, `metrics.json`, `roc.png`, `misid_vs_E.png`.
 
 ## 1. Why this design
 
-Reference points (see conversation sources):
+Reference points:
 
 - FCC-ee LAr ECAL study: π⁰ mis-ID 10 % at 95 % γ efficiency with a hybrid dense+CNN network. This is the number to beat.
 - SOOP (Melennec & Magniette, arXiv:2609.34500): per-hit "dominant energy fraction + entry point" regression disentangles two overlapping photon showers, with static kNN message passing matching object-condensation performance at lower cost. Trained only on photon pairs with 1°–4.5° separation and clustered post hoc with a non-differentiable GMM.
