@@ -108,3 +108,14 @@ Self-check: `python model.py`.
 2. Run `--strips` variants (1; 1,2; 2) at fixed channel count and plot mis-ID vs energy per configuration.
 3. Add a Transformer encoder as a second model under the same heads and compare at the 95 % working point.
 4. Fit the shower constants (X₀, R_M, noise) on the full simulation if the parametric generator stays in use for fast scans.
+
+## 7. First run (parametric sample, strips in layer 1)
+
+`results/run_L1`: 12 000 training / 3 000 test events, 12 epochs.
+
+| model | AUC | π⁰ mis-ID @ 95 % γ eff. | 5–10 GeV | 10–20 | 20–35 | 35–50 |
+|---|---|---|---|---|---|---|
+| BDT shower shapes | 0.977 | 14.1 % | 0 % | 2.8 % | 40 % | 46 % |
+| GNN multi-task | 0.9999 | 0.0 % | 0 % | 0 % | 0 % | 1.3 % |
+
+The BDT degrades above 20 GeV as expected. The near-zero GNN mis-ID shows the parametric showers are too regular (two independent conversion depths and smooth Gamma profiles are an easy longitudinal handle); only the ordering and the energy trend carry over. Absolute numbers require the k4geo sample.
