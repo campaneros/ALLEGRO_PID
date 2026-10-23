@@ -1,6 +1,6 @@
-"""Parametric EM-shower generator on an ALLEGRO-like strip ECAL."""
 import numpy as np
 
+# ALLEGRO-like ECAL barrel, lengths in mm and energies in GeV
 R_IN = 2160.0
 X0 = 14.0
 RM = 40.0
@@ -18,15 +18,16 @@ def pitch_x(layer, strip_layers):
     return CELL_X / 4 if layer in strip_layers else CELL_X
 
 def _shower_quanta(rng, E, x0, y0, tx, ty, n=3000):
-
+    # The shower is split into n energy quanta.
+    # Conversion depth (in X0), then a Gamma longitudinal profile with a small event-by-event fluctuation.
     t_conv = rng.exponential(9 / 7)
-
     tmax = max(np.log(E / EC) - 0.5, 1.0)
     b = 0.5
     a = b * tmax + 1
     a = max(a * rng.normal(1, 0.05), 1.1)
     t = t_conv + rng.gamma(a, 1 / b, n)
 
+    # Transverse profile: narrow core and wider halo, both widening with depth
     core = rng.random(n) < 0.75
     scale = np.where(core, 0.3, 1.0) * RM * (0.6 + 0.4 * t / tmax)
     r = rng.exponential(scale)
@@ -38,6 +39,7 @@ def _shower_quanta(rng, E, x0, y0, tx, ty, n=3000):
     return x, y, z, w
 
 def _bin(x, y, z, w, src, strip_layers):
+    # Sum the quanta into cells; frac is the share of each cell energy coming from photon 0
     layer = np.searchsorted(LAYER_Z, z, side="right") - 1
     ok = (layer >= 0) & (layer < N_LAYERS)
     x, y, layer, w, src = x[ok], y[ok], layer[ok], w[ok], src[ok]
@@ -60,13 +62,12 @@ def make_event(rng, is_pi0, E, strip_layers=(1,), tilt=0.0):
     y0 = rng.uniform(-CELL_Y / 2, CELL_Y / 2)
     tx, ty = np.tan(tilt), 0.0
     if is_pi0:
-
+        # Isotropic decay in the pi0 rest frame, boosted to the lab
         c = rng.uniform(-1, 1)
         beta = np.sqrt(1 - (M_PI0 / E) ** 2)
         gam = E / M_PI0
         e1 = gam * M_PI0 / 2 * (1 + beta * c)
         e2 = E - e1
-
         th1 = np.arctan2(np.sqrt(1 - c * c), gam * (c + beta))
         th2 = np.arctan2(np.sqrt(1 - c * c), gam * (-c + beta))
         az = rng.uniform(0, 2 * np.pi)
@@ -80,7 +81,7 @@ def make_event(rng, is_pi0, E, strip_layers=(1,), tilt=0.0):
             parts.append(q + (np.full(len(q[0]), src),))
         x, y, z, w, src = [np.concatenate([p[i] for p in parts]) for i in range(5)]
         m = M_PI0
-
+        # Photon A is always the more energetic one
         if e2 > e1:
             src = 1 - src
             entries = entries[::-1]
@@ -91,11 +92,14 @@ def make_event(rng, is_pi0, E, strip_layers=(1,), tilt=0.0):
         m = 0.0
     cx, cy, lay, e, frac, px = _bin(x, y, z, w, src, strip_layers)
 
+    # Gaussian noise scaled with the cell area, then a 2 sigma threshold
     sig = NOISE_CELL * np.sqrt(px / CELL_X)
     e = e + rng.normal(0, sig)
     keep = e > THRESHOLD * sig
     hits = np.stack([cx, cy, lay, e, (px < CELL_X).astype(float)], 1)[keep].astype(np.float32)
-    return dict(hits=hits, frac=frac[keep].astype(np.float32), entry=np.array(entries, np.float32),
+    cell = np.stack([px, np.full_like(px, CELL_Y)], 1)[keep].astype(np.float32)
+    z = ((LAYER_Z[lay] + LAYER_Z[lay + 1]) / 2)[keep].astype(np.float32)
+    return dict(hits=hits, cell=cell, z=z, frac=frac[keep].astype(np.float32), entry=np.array(entries, np.float32),
                 y=int(is_pi0), E=float(E), m=float(m))
 
 def make_dataset(n, seed=0, emin=5.0, emax=50.0, strip_layers=(1,), tilt=0.0):

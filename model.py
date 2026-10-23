@@ -1,22 +1,22 @@
-"""Multi-task GNN for gamma / pi0 discrimination on calorimeter hit graphs."""
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from data import LAYER_Z, CELL_X, M_PI0
+from data import M_PI0
 
-K = 8
-POS_SCALE = 50.0
+K = 8             # neighbours per hit
+POS_SCALE = 50.0  # mm
 
 def event_to_graph(ev):
     h = ev["hits"]
     x, y, lay, e, strip = h.T
-    z = (LAYER_Z[lay.astype(int)] + LAYER_Z[lay.astype(int) + 1]) / 2
-    pos = np.stack([x, y, z], 1) / POS_SCALE
+    # geometry enters only through physical quantities (position, depth, cell size), never the layer index,
+    # so the same network trains on any readout design
+    pos = np.stack([x, y, ev["z"]], 1) / POS_SCALE
     etot = e.sum()
     feat = np.concatenate([pos, np.log(e)[:, None], strip[:, None], (e / etot)[:, None],
-                           (lay / 10.0)[:, None]], 1).astype(np.float32)
+                           ev["cell"] / POS_SCALE], 1).astype(np.float32)
     pos_t = torch.tensor(pos, dtype=torch.float32)
     n = len(h)
     k = min(K, n - 1)
@@ -25,6 +25,7 @@ def event_to_graph(ev):
     src = torch.arange(n).repeat_interleave(k)
     dst = nbr.reshape(-1)
 
+    # targets: fraction of the dominant photon in each hit and the entry point of that photon
     dom = (ev["frac"] < 0.5).astype(int)
     entry = ev["entry"][dom] / POS_SCALE
     return dict(x=torch.tensor(feat), pos=pos_t, edge=torch.stack([src, dst]),
@@ -36,6 +37,7 @@ def event_to_graph(ev):
                 E=torch.tensor([ev["E"]], dtype=torch.float32))
 
 def collate(graphs):
+    # merge the graphs of a batch into one disconnected graph, with the graph index of every node in "batch"
     out, off = {}, 0
     batch = []
     for i, g in enumerate(graphs):
@@ -53,6 +55,7 @@ def mlp(i, o, h=64):
     return nn.Sequential(nn.Linear(i, h), nn.LeakyReLU(), nn.Linear(h, o), nn.LeakyReLU())
 
 class EdgeConv(nn.Module):
+    # message from the neighbour features, their difference and the relative position; mean over the neighbours
 
     def __init__(self, din, dout):
         super().__init__()
@@ -66,7 +69,7 @@ class EdgeConv(nn.Module):
         return out / cnt.clamp(min=1)
 
 class Pi0GammaNet(nn.Module):
-    def __init__(self, din=7, h=32, layers=3):
+    def __init__(self, din=8, h=32, layers=3, dropout=0.0):
         super().__init__()
         self.enc = mlp(din, h)
         self.convs = nn.ModuleList()
@@ -75,7 +78,8 @@ class Pi0GammaNet(nn.Module):
             self.convs.append(EdgeConv(d, h))
             d += h
         self.node_head = nn.Sequential(mlp(d, h), nn.Linear(h, 3))
-        self.graph_head = nn.Sequential(mlp(2 * d, h), nn.Linear(h, 1))
+        # optional dropout before the classifier output, against overfitting
+        self.graph_head = nn.Sequential(mlp(2 * d, h), nn.Dropout(dropout), nn.Linear(h, 1))
 
     def forward(self, b):
         x, pos, edge, batch, n = b["x"], b["pos"], b["edge"], b["batch"], b["n_graphs"]
@@ -86,6 +90,7 @@ class Pi0GammaNet(nn.Module):
         frac = 0.5 + 0.5 * torch.sigmoid(node[:, 0])
         entry = node[:, 1:]
 
+        # event-level pooling: energy-weighted mean and max of the node features
         w = b["e"] / torch.zeros(n, device=x.device).index_add_(0, batch, b["e"])[batch]
         mean = torch.zeros(n, h.shape[1], device=x.device).index_add_(0, batch, h * w[:, None])
         mx = torch.full((n, h.shape[1]), -1e9, device=x.device).scatter_reduce_(
@@ -93,9 +98,68 @@ class Pi0GammaNet(nn.Module):
         g = self.graph_head(torch.cat([mean, mx], 1))
         return dict(logit=g[:, 0], frac=frac, entry=entry)
 
-def loss_fn(out, b, w_frac=1.0, w_pos=0.1):
+def to_dense(x, batch, n):
+    # nodes of n collated graphs -> padded tensor [n, Nmax, F], mask of the real nodes and the slot of every node
+    cnt = torch.bincount(batch, minlength=n)
+    slot = torch.arange(len(batch), device=x.device) - torch.repeat_interleave(torch.cumsum(cnt, 0) - cnt, cnt)
+    out = x.new_zeros(n, int(cnt.max()), x.shape[1])
+    mask = torch.zeros(n, out.shape[1], dtype=torch.bool, device=x.device)
+    out[batch, slot], mask[batch, slot] = x, True
+    return out, mask, slot
+
+class GravNetConv(nn.Module):
+    # GravNet layer (Qasim, Kieseler, Iiyama, Pierini 2019). Each node is projected into a learned space; its k nearest
+    # nodes of the same event in that space send their messages weighted by exp(-10 d^2), aggregated by mean and max.
+
+    def __init__(self, din, dout, S=4, FLR=22, k=16):
+        super().__init__()
+        self.k, self.s, self.f = k, nn.Linear(din, S), nn.Linear(din, FLR)
+        self.out = nn.Sequential(nn.Linear(din + 2 * FLR, dout), nn.LeakyReLU())
+
+    def forward(self, h, batch, n):
+        S, mask, slot = to_dense(self.s(h), batch, n)
+        Fd = to_dense(self.f(h), batch, n)[0]
+        d2 = torch.cdist(S, S) ** 2 + (~mask)[:, None, :] * 1e9  # padded slots are never neighbours
+        k = min(self.k, S.shape[1])
+        d2k, idx = d2.topk(k, largest=False)  # the node itself is included (distance 0)
+        w = torch.exp(-10 * d2k) * (d2k < 1e8)
+        nb = torch.gather(Fd[:, None].expand(-1, Fd.shape[1], -1, -1), 2, idx[..., None].expand(-1, -1, -1, Fd.shape[-1]))
+        msg = w[..., None] * nb
+        agg = torch.cat([msg.mean(2), msg.max(2).values], -1)[batch, slot]
+        return self.out(torch.cat([h, agg], 1))
+
+class GravNetPID(nn.Module):
+    # Same heads and outputs as Pi0GammaNet, with GravNet blocks instead of EdgeConv
+
+    def __init__(self, din=8, h=64, layers=4, dropout=0.0):
+        super().__init__()
+        self.enc = mlp(din, h)
+        self.convs = nn.ModuleList()
+        d = h
+        for _ in range(layers):
+            self.convs.append(GravNetConv(d, h))
+            d += h
+        self.node_head = nn.Sequential(mlp(d, h), nn.Linear(h, 3))
+        self.graph_head = nn.Sequential(mlp(2 * d, h), nn.Dropout(dropout), nn.Linear(h, 1))
+
+    def forward(self, b):
+        x, batch, n = b["x"], b["batch"], b["n_graphs"]
+        h = self.enc(x)
+        for conv in self.convs:
+            h = torch.cat([h, conv(h, batch, n)], 1)
+        node = self.node_head(h)
+        w = b["e"] / torch.zeros(n, device=x.device).index_add_(0, batch, b["e"])[batch]
+        mean = torch.zeros(n, h.shape[1], device=x.device).index_add_(0, batch, h * w[:, None])
+        mx = torch.full((n, h.shape[1]), -1e9, device=x.device).scatter_reduce_(
+            0, batch[:, None].expand_as(h), h, "amax", include_self=False)
+        logit = self.graph_head(torch.cat([mean, mx], 1))[:, 0]
+        return dict(logit=logit, frac=0.5 + 0.5 * torch.sigmoid(node[:, 0]), entry=node[:, 1:])
+
+def loss_fn(out, b, w_frac=1.0, w_pos=0.1, smooth=0.0):
     y = b["y"]
-    l_cls = F.binary_cross_entropy_with_logits(out["logit"], y)
+    # label smoothing keeps the logits finite, so that saturated scores do not tie in the ROC
+    l_cls = F.binary_cross_entropy_with_logits(out["logit"], y * (1 - smooth) + 0.5 * smooth)
+    # the per-hit losses only make sense for pi0 events
     pi0_node = y[b["batch"]] > 0.5
     if pi0_node.any():
         we = torch.sqrt(b["e"] * b["frac"])[pi0_node]

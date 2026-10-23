@@ -9,6 +9,38 @@ python train.py --n 12000 --epochs 12 --strips 1,2 --out run_L12   # strip-segme
 
 Each run writes `model.pt`, `metrics.json`, `roc.png`, `misid_vs_E.png`.
 
+On the ALLEGRO_strips full-simulation reco (`reco.py`; LCG_107 view for torch + uproot):
+
+```
+source /cvmfs/sft.cern.ch/lcg/views/LCG_107/x86_64-el9-gcc13-opt/setup.sh
+python train.py --design base --n 20000 --epochs 15 --out run_base               # theta50to130, files 0-7 train, 8-9 test
+python train.py --design S4T --theta theta90 --n 20000 --out run_S4T_th90        # any design, same network
+```
+
+`reco.py` builds the same event dict as `make_event` from the cells of the leading sliding-window cluster
+(`AugmentedEMBCaloClusters` → `EMBCaloClusterCells`), equal numbers of γ and π⁰ at 5, 10, 20, 35, 50, 80, 100 GeV:
+
+- x = R·(θ_cell − θ₀), y = R·(φ_cell − φ₀) around the cluster energy barycentre (θ₀ snapped to a strip centre), depth = ρ_cell − R.
+- Each hit carries its cell size (θ, φ) from the design's readout table (`DESIGNS`), and is_strip = cell of one θ strip.
+- Truth only for the targets: `frac` = share of the cell's `CaloHitMCParticleLinks` weight from the leading π⁰ daughter
+  (secondaries assigned to the daughter they come from), `entry` = daughter directions in the same frame.
+
+The node features are physical only (position, depth, log E, E fraction, is_strip, cell size), with no layer index, so one
+architecture trains on any readout design. Parametric events carry the same `z`/`cell` keys.
+
+On the CERN Kubeflow (ml.cern.ch), with metrics sent to Comet:
+
+```
+python3 kubeflow_submit.py --design base --n 20000 --epochs 15 --out run_base --monitor-every 3
+python3 kubeflow_submit.py --cpu 8 --mem 32G --design S4T --theta theta90 --out run_S4T_th90
+```
+
+The script copies the code to `/eos/user/m/mcampana/ALLEGRO/kubeflow/pid_<date>/code` and starts a one-step pipeline
+with that folder; all the options it does not know are passed to `train.py`. One-time setup in a notebook terminal on
+ml.cern.ch: `kubectl create secret generic comet --from-literal=COMET_API_KEY=<key>`. To submit from lxplus, export
+`KF_TOKEN=$(kubectl create token default-editor --duration=168h --audience=istio-ingressgateway.istio-system.svc.cluster.local)`
+and install `kfp==2.13.0` and `kfp-kubernetes==1.5.0`.
+
 ## 1. Why this design
 
 Reference points:
@@ -68,7 +100,7 @@ Self-check: `python data.py`.
 
 Graph construction (`event_to_graph`):
 
-- Node features (7): x, y, z scaled by 50 mm, log E, is_strip, E/E_event, layer/10.
+- Node features (8): x, y, z scaled by 50 mm, log E, is_strip, E/E_event, cell size in θ and φ scaled by 50 mm.
 - Edges: kNN with k = 8 in scaled (x, y, z), computed once with `torch.cdist` (events have ~260 hits).
 - Targets: `frac` = max(f, 1−f) ∈ [0.5, 1] (SOOP's permutation-safe dominant fraction), `entry` = entry point of the photon dominating each hit.
 
